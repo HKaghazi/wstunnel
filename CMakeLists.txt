@@ -1,6 +1,11 @@
 cmake_minimum_required (VERSION 3.5)
 project (wstunnel)
 
+# Set the C++ compiler
+if (NOT CMAKE_CXX_COMPILER)
+    message(FATAL_ERROR "No C++ compiler found")
+endif()
+
 if(UNIX AND NOT APPLE)
     set(OPENSSL_ROOT_DIR "/usr/local/ssl")
 elseif(APPLE)
