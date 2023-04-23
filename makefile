@@ -22,7 +22,8 @@ OBJS = $(SRCS:.cpp=.o)
 # Executable file to generate
 TARGET = build/wstunnel
 
-all: $(TARGET)
+all:
+	$(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -L$(OPENSSL_LIBDIR) $(LIBS) $(OBJS) -o $(TARGET)
