@@ -17,13 +17,15 @@
 #define CLIENT_PORT 9090
 #define BUFFER_SIZE 2048
 
-SSL_CTX *create_context(void) {
+SSL_CTX *create_context(void)
+{
     const SSL_METHOD *method;
     SSL_CTX *ctx;
 
     method = TLS_server_method();
     ctx = SSL_CTX_new(method);
-    if (!ctx) {
+    if (!ctx)
+    {
         perror("Unable to create SSL context");
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
@@ -32,12 +34,162 @@ SSL_CTX *create_context(void) {
     return ctx;
 }
 
-int main(int argc, char const *argv[]) {
+int setup_server_socket(int port)
+{
     int opt = TRUE;
-    int server_socket, client_socket, activity, valread, sd, max_sd;
-    struct sockaddr_in server_address, client_address;
+    int server_socket;
+    struct sockaddr_in server_address;
+
+    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+    {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
+    {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = INADDR_ANY;
+    server_address.sin_port = htons(port);
+
+    if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0)
+    {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server is up, IP address: %s, Port: %d.\n", inet_ntoa(server_address.sin_addr), ntohs(server_address.sin_port));
+
+    if (listen(server_socket, 1) < 0)
+    {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    return server_socket;
+}
+
+int setup_client_socket(char *ip_address, int port)
+{
+    int client_socket;
+    struct sockaddr_in client_address;
+
+    if ((client_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+    {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    client_address.sin_family = AF_INET;
+    client_address.sin_addr.s_addr = inet_addr(ip_address);
+    client_address.sin_port = htons(port);
+
+    if (connect(client_socket, (struct sockaddr *)&client_address, sizeof(client_address)) < 0)
+    {
+        perror("connect failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Client connected, IP address: %s, Port: %d.\n", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
+
+    return client_socket;
+}
+
+SSL *create_ssl_context(SSL_CTX *ctx, int socket_fd)
+{
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, socket_fd);
+
+    // Establish SSL connection with client or server
+    int ssl_status = SSL_accept(ssl);
+    if (ssl_status <= 0)
+    {
+        ERR_print_errors_fp(stderr);
+        return NULL;
+    }
+
+    return ssl;
+}
+
+void communicate_over_ssl(SSL *ssl_1, SSL *ssl_2)
+{
+    int activity, valread, max_sd;
     char buffer[BUFFER_SIZE];
     fd_set readfds;
+
+    while (TRUE)
+    {
+        FD_ZERO(&readfds);
+        FD_SET(SSL_get_fd(ssl_1), &readfds);
+        FD_SET(SSL_get_fd(ssl_2), &readfds);
+        max_sd = (SSL_get_fd(ssl_1) > SSL_get_fd(ssl_2)) ? SSL_get_fd(ssl_1) : SSL_get_fd(ssl_2);
+
+        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+
+        if ((activity < 0) && (errno != EINTR))
+        {
+            printf("select error");
+        }
+        else if (activity == 0)
+        { // Timeout occurred
+            printf("Timeout occurred. No new data received.\n");
+            continue;
+        }
+
+        if (FD_ISSET(SSL_get_fd(ssl_1), &readfds))
+        {
+            valread = SSL_read(ssl_1, buffer, BUFFER_SIZE);
+            if (valread <= 0)
+            {
+                printf("Client disconnected.\n");
+                close(SSL_get_fd(ssl_1));
+                SSL_shutdown(ssl_1);
+                SSL_free(ssl_1);
+                return;
+            }
+            buffer[valread] = '\0';
+            if (SSL_write(ssl_2, buffer, strlen(buffer)) != strlen(buffer))
+            {
+                perror("send to server failed");
+                return;
+            }
+        }
+
+        if (FD_ISSET(SSL_get_fd(ssl_2), &readfds))
+        {
+            valread = SSL_read(ssl_2, buffer, BUFFER_SIZE);
+            if (valread <= 0)
+            {
+                printf("Server disconnected.\n");
+                close(SSL_get_fd(ssl_2));
+                SSL_shutdown(ssl_2);
+                SSL_free(ssl_2);
+                return;
+            }
+            buffer[valread] = '\0';
+            if (SSL_write(ssl_1, buffer, strlen(buffer)) != strlen(buffer))
+            {
+                perror("send to client failed");
+                return;
+            }
+        }
+    }
+
+    SSL_shutdown(ssl_1);
+    SSL_free(ssl_1);
+
+    SSL_shutdown(ssl_2);
+    SSL_free(ssl_2);
+}
+
+int main(int argc, char const *argv[])
+{
+    int server_socket, client_socket;
+    SSL_CTX *ctx;
 
     // Initialize OpenSSL
     SSL_library_init();
@@ -45,154 +197,33 @@ int main(int argc, char const *argv[]) {
     OpenSSL_add_all_algorithms();
 
     // Create SSL context
-    SSL_CTX *ctx = create_context();
+    ctx = create_context();
 
     // Set level of security
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    server_socket = setup_server_socket(SERVER_PORT);
+    printf("Waiting for connection from client...\n");
 
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+    printf("NOK NOK\n");
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = INADDR_ANY;
-    server_address.sin_port = htons(SERVER_PORT);
+    if ((client_socket = accept(server_socket, (struct sockaddr *)NULL, NULL)) < 0)
+    {
 
-    if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Server is up, IP address: %s, Port: %d.\n", inet_ntoa(server_address.sin_addr), ntohs(server_address.sin_port));
-
-    if (listen(server_socket, 1) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    socklen_t addrlen = sizeof(client_address);
-    puts("Waiting for connection ...");
-
-    if ((client_socket = accept(server_socket, (struct sockaddr *)&client_address, (socklen_t*)&addrlen)) < 0) {
         perror("accept");
         exit(EXIT_FAILURE);
     }
 
-    printf("Client connected, IP address: %s, Port: %d.\n", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
+    printf("OKOKOKOK\n");
 
-    // Create SSL structure
-    SSL *client_ssl = SSL_new(ctx);
-    SSL_set_fd(client_ssl, client_socket);
+    SSL *server_ssl = create_ssl_context(ctx, client_socket);
 
-    // Establish SSL connection with client
-    int ssl_status = SSL_accept(client_ssl);
-    if (ssl_status <= 0) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
+    client_socket = setup_client_socket("192.168.1.109", CLIENT_PORT);
 
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    SSL *client_ssl = create_ssl_context(ctx, client_socket);
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = INADDR_ANY;
-    server_address.sin_port = htons(CLIENT_PORT);
+    communicate_over_ssl(server_ssl, client_ssl);
 
-    if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_socket, 1) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    addrlen = sizeof(client_address);
-    puts("Waiting for connection ...");
-
-    if ((client_socket = accept(server_socket, (struct sockaddr *)&client_address, (socklen_t*)&addrlen)) < 0) {
-        perror("accept");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Server connected, IP address: %s, Port: %d.\n", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
-
-    // Create SSL structure
-    SSL *server_ssl = SSL_new(ctx);
-    SSL_set_fd(server_ssl, client_socket);
-
-    // Establish SSL connection with server
-    ssl_status = SSL_connect(server_ssl);
-    if (ssl_status <= 0) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-
-    while (TRUE) {
-        FD_ZERO(&readfds);
-        FD_SET(SSL_get_fd(client_ssl), &readfds);
-        FD_SET(SSL_get_fd(server_ssl), &readfds);
-        max_sd = (SSL_get_fd(client_ssl) > SSL_get_fd(server_ssl)) ? SSL_get_fd(client_ssl) : SSL_get_fd(server_ssl);
-
-        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
-
-        if ((activity < 0) && (errno != EINTR)) {
-            printf("select error");
-        } else if (activity == 0) { // Timeout occurred
-            printf("Timeout occurred. No new data received.\n");
-            continue;
-        }
-
-        if (FD_ISSET(SSL_get_fd(client_ssl), &readfds)) {
-            valread = SSL_read(client_ssl, buffer, BUFFER_SIZE);
-            if (valread <= 0) {
-                printf("Client disconnected.\n");
-                close(client_socket);
-                SSL_shutdown(client_ssl);
-                SSL_free(client_ssl);
-                SSL_CTX_free(ctx);
-                return 0;
-            }
-            buffer[valread] = '\0';
-            if (SSL_write(server_ssl, buffer, strlen(buffer)) != strlen(buffer)) {
-                perror("send to server failed");
-                return -1;
-            }
-        }
-
-        if (FD_ISSET(SSL_get_fd(server_ssl), &readfds)) {
-            valread = SSL_read(server_ssl, buffer, BUFFER_SIZE);
-            if (valread <= 0) {
-                printf("Server disconnected.\n");
-                close(server_socket);
-                SSL_shutdown(server_ssl);
-                SSL_free(server_ssl);
-                SSL_CTX_free(ctx);
-                return 0;
-            }
-            buffer[valread] = '\0';
-            if (SSL_write(client_ssl, buffer, strlen(buffer)) != strlen(buffer)) {
-                perror("send to client failed");
-                return -1;
-            }
-        }
-    }
-
-    SSL_shutdown(client_ssl);
-    SSL_free(client_ssl);
-    SSL_CTX_free(ctx);
-
-    SSL_shutdown(server_ssl);
-    SSL_free(server_ssl);
     SSL_CTX_free(ctx);
 
     return 0;
